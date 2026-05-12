@@ -185,7 +185,16 @@ The pipeline accepts only a single canonical CSV format. A template file is prov
 
 **Goal:** Identify and rank customers who are at risk of churning.
 
-This stage has two sub-components that run together: RFM Scoring and Rule-Based Triggers.
+**Execution order (runtime optimization):**
+
+```
+1. Rules run FIRST → catches obvious at-risk customers (HIGH risk, bypasses ML)
+2. RFM scoring → computed for all customers (needed for ML features + ranking)
+3. ML predictor (if ml_enabled) → only scores customers NOT already flagged by rules
+4. Signal combination → assembles final at-risk list with risk levels
+```
+
+**Why rules first:** Rules are cheap deterministic checks. Customers caught by rules are confirmed HIGH risk, so running them through ML adds no value — the outcome is the same. This saves ML inference cost at scale. All customers (including rule-flagged) are still used during offline ML training — only runtime inference skips the redundant scoring.
 
 ---
 
@@ -216,7 +225,7 @@ This stage has two sub-components that run together: RFM Scoring and Rule-Based 
 
 **What it does:** Takes each customer's RFM scores as input features and outputs a churn probability (0.0–1.0). Customers above `ML_CHURN_THRESHOLD` are flagged as at-risk independently of rule triggers.
 
-**Toggle:** Controlled by `ml_enabled` flag per campaign (default: `false`). When `false`, this step is skipped entirely — RFM + rules run as the sole signal. When `true`, the loaded model scores every customer and its output is combined with RFM + rules in Stage 2d.
+**Toggle:** Controlled by `ml_enabled` flag per campaign (default: `false`). When `false`, this step is skipped entirely — RFM + rules run as the sole signal. When `true`, the loaded model scores customers **not already flagged by rules** (runtime optimization — see execution order above) and its output is combined with RFM + rules in Stage 2d.
 
 **Algorithm:** Random Forest classifier (scikit-learn `RandomForestClassifier`).
 - Features: `r_score`, `f_score`, `m_score`, `days_since_last_purchase`, `total_spend`, `avg_order_value`, `purchase_count`
@@ -236,16 +245,31 @@ This stage has two sub-components that run together: RFM Scoring and Rule-Based 
 
 #### 2c. Rule-Based Triggers
 
-Hard cutoff rules applied in addition to RFM scoring. A customer flagged by any rule is included in the at-risk list regardless of their RFM score.
+Hard cutoff rules applied as a safety net before RFM/ML scoring. A customer flagged by any rule is included in the at-risk list regardless of their RFM score. Each rule is implemented as a standalone function in `engine/rules.py` and runs through the `evaluate_rules` orchestrator — adding, removing, or tuning a rule is a localized change.
 
 | Rule ID | Name | Condition | Priority |
 |---|---|---|---|
-| R01 | Long Inactivity | No purchase in last N days (default: 30) | High |
-| R02 | Frequency Drop | Purchase count in current period < 50% of same-length prior period | Medium |
-| R03 | High-Value Lapse | Customer was in top 20% by spend historically, now inactive > 14 days | High |
+| R01 | Long Inactivity | No purchase in last `INACTIVITY_THRESHOLD_DAYS` days (default: 30) | High |
+| R02 | Frequency Drop | Current period purchase count < `FREQUENCY_DROP_THRESHOLD` × prior period count (default: 0.5 = >50% drop) | Medium |
+| R03 | High-Value Lapse | Customer's total spend ≥ `HIGH_VALUE_SPEND_THRESHOLD`, now inactive > 14 days | High |
 | R04 | Single Purchase | Only 1 purchase ever recorded, no subsequent return | Medium |
 
 **Period definition for R02:** Current period = last `RFM_WINDOW_DAYS / 2` days. Prior period = the `RFM_WINDOW_DAYS / 2` days before that. Changing the comparison window is a config change only (`RFM_WINDOW_DAYS`).
+
+**Tunable threshold (R02):** `FREQUENCY_DROP_THRESHOLD` (default: 0.5) controls how steep a frequency drop must be to fire. Lower = stricter (fires on smaller drops), higher = more lenient.
+
+**Hybrid threshold strategy (R03):** The high-value threshold uses a **fixed config + drift detection** pattern instead of pure dynamic computation. This avoids the cost of computing a population-wide 80th percentile on every run, while still self-correcting when the data distribution shifts.
+
+```
+1. Run R03 with HIGH_VALUE_SPEND_THRESHOLD (fixed config)         ← fast path
+2. Compute dynamic 80th-percentile threshold across population
+3. drift = |dynamic - fixed| / fixed
+4. If drift > THRESHOLD_DRIFT_TOLERANCE (default: 0.1 = 10%):
+       re-run R03 with the dynamic threshold                       ← self-correction
+   Else: keep results from step 1                                  ← stable fast path
+```
+
+In production, the config value should be reviewed and updated periodically when drift alerts fire. For the POC, drift will be 0 since the dataset is static — the structure is in place for production use.
 
 ---
 
@@ -596,6 +620,9 @@ All configuration lives in `.env` (secrets) and `config.py` (defaults with env o
 | `SENDER_MODE` | `mock` or `meta` | `mock` |
 | `SCORING_VERSION` | Active scoring strategy version (`v1.0`, `v1.1`, ...) | `v1.0` |
 | `INACTIVITY_THRESHOLD_DAYS` | Days of inactivity to trigger R01 rule | `30` |
+| `FREQUENCY_DROP_THRESHOLD` | R02 trigger ratio — current period count must be below this fraction of prior period (0.5 = >50% drop) | `0.5` |
+| `HIGH_VALUE_SPEND_THRESHOLD` | Fixed total-spend cutoff above which a customer is "high value" for R03 | `1500.0` |
+| `THRESHOLD_DRIFT_TOLERANCE` | If dynamic 80th percentile differs from `HIGH_VALUE_SPEND_THRESHOLD` by more than this fraction, re-run R03 with dynamic value | `0.1` |
 | `RFM_WINDOW_DAYS` | Lookback window for RFM calculation | `180` |
 | `RFM_AT_RISK_THRESHOLD` | Combined RFM sum below this = at-risk | `8` |
 | `MIN_CUSTOMER_AGE_DAYS` | Exclude customers newer than this from scoring | `14` |
@@ -721,3 +748,6 @@ These are documented weaknesses that must be resolved before production. See `WE
 | C4 | Promo code lifecycle: `pending → active → redeemed/cancelled` — orphaned codes from aborted blasts are never redeemable | ✅ Resolved | Stage 3/4/5 |
 | C5 | SQL filter injection guard specified: `sqlparse` AST walk, token allowlist/blocklist, parameterized execution | ✅ Resolved | Stage 2 |
 | C1 | Random Forest ML ChurnPredictor added as Stage 2b — `ml_enabled` flag per campaign, trained offline, loaded at runtime | ✅ Resolved | Stage 2 |
+| C6 | Stage 2 execution order optimized: rules-first → RFM → ML for unflagged only. Rule-caught HIGH risk customers bypass ML scoring at runtime (still used in training) | ✅ Resolved | Stage 2 |
+| C7 | R02 frequency-drop ratio promoted to config (`FREQUENCY_DROP_THRESHOLD`) — tunable without code change | ✅ Resolved | Stage 2c |
+| C8 | R03 high-value threshold uses hybrid fixed-config + drift detection pattern (`HIGH_VALUE_SPEND_THRESHOLD` + `THRESHOLD_DRIFT_TOLERANCE`) — avoids per-run percentile recomputation while self-correcting on data drift | ✅ Resolved | Stage 2c |
