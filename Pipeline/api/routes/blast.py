@@ -28,7 +28,7 @@ def _apply_cooldown(at_risk):
     cutoff = (datetime.now() - timedelta(days=BLAST_COOLDOWN_DAYS)).isoformat()
     with transaction() as conn:
         rows = conn.execute(
-            "SELECT customer_id FROM customer_blast_status WHERE last_sent_at >= ?",
+            "SELECT customer_id FROM customer WHERE last_sent_at >= ?",
             (cutoff,),
         ).fetchall()
     on_cooldown = {r["customer_id"] for r in rows}
@@ -80,9 +80,10 @@ def send_blast(customer_messages, blast_id):
             )
             conn.execute(
                 """
-                INSERT INTO customer_blast_status (customer_id, last_sent_at, sent_promo_types)
-                VALUES (?, ?, ?)
+                INSERT INTO customer (customer_id, phone_number, last_sent_at, sent_promo_types)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(customer_id) DO UPDATE SET
+                    phone_number = excluded.phone_number,
                     last_sent_at = excluded.last_sent_at,
                     sent_promo_types = CASE
                         WHEN sent_promo_types = '' THEN excluded.sent_promo_types
@@ -91,6 +92,7 @@ def send_blast(customer_messages, blast_id):
                 """,
                 (
                     cm.customer.customer_id,
+                    cm.message.to,
                     datetime.now().isoformat(),
                     cm.promo.promo_type,
                 ),

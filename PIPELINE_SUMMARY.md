@@ -145,7 +145,7 @@ See you soon!
 
 **Interface:** `BaseSender.send(message, customer_id, blast_id) -> SendResult`
 
-`MockSender` prints the message preview to console and returns `SendResult(status="mocked")`. All DB persistence (blast_log, customer_blast_status) is handled by the API layer — the sender owns no DB logic.
+`MockSender` prints the message preview to console and returns `SendResult(status="mocked")`. All DB persistence (blast_log, customer) is handled by the API layer — the sender owns no DB logic.
 
 `MetaSender` is a stub for the production Meta Cloud API swap — switching is a single config change (`SENDER_MODE=meta`).
 
@@ -165,7 +165,7 @@ See you soon!
 | Table | Purpose |
 |---|---|
 | `blast_log` | Every dispatch attempt — `blast_id`, `customer_id`, `phone`, `template_name`, `promo_code`, `status` (mocked/sent/failed), `error_code`, `error_reason`, `sent_at` |
-| `customer_blast_status` | Cooldown + promo history — `customer_id` (PK), `last_sent_at`, `sent_promo_types` (comma-separated) |
+| `customer` | Per-customer state — `customer_id` (PK), `phone_number`, `last_sent_at`, `sent_promo_types` (comma-separated), `is_unsubscribe` (0/1) |
 
 ---
 
@@ -180,11 +180,11 @@ See you soon!
 | Function | Job |
 |---|---|
 | `_run_engine(ml_enabled)` | `load_customers` + `analyze` → returns `at_risk` list |
-| `_apply_cooldown(at_risk)` | Queries `customer_blast_status`, drops customers within `BLAST_COOLDOWN_DAYS` |
+| `_apply_cooldown(at_risk)` | Queries `customer`, drops customers within `BLAST_COOLDOWN_DAYS` |
 | `assign_promos(at_risk)` | Calls `assign_promo()` per customer → returns `list[CustomerMessage]` |
 | `construct_messages(cms)` | Calls `construct_message()` per item, fills `cm.message` |
 | `validate_messages(cms)` | Pre-flight: checks slots + length → returns `{customer_id: error}` dict |
-| `send_blast(cms, blast_id)` | `MockSender.send()` per message, writes `blast_log`, upserts `customer_blast_status` |
+| `send_blast(cms, blast_id)` | `MockSender.send()` per message, writes `blast_log`, upserts `customer` |
 
 **Endpoints:**
 
@@ -197,7 +197,7 @@ See you soon!
 _run_engine → _apply_cooldown → assign_promos → construct_messages
 → validate_messages (abort if errors)
 → blast_id = uuid4()
-→ send_blast: MockSender + INSERT blast_log + UPSERT customer_blast_status
+→ send_blast: MockSender + INSERT blast_log + UPSERT customer
 → return { blast_id, total, total_sent, total_failed, sender_mode }
 ```
 
@@ -248,7 +248,7 @@ _run_engine()
    │
    ▼
 _apply_cooldown(at_risk)
-   └─ drop customers in customer_blast_status within BLAST_COOLDOWN_DAYS
+   └─ drop customers in customer within BLAST_COOLDOWN_DAYS
    │
    ▼
 assign_promos(at_risk) → list[CustomerMessage]
@@ -269,7 +269,7 @@ blast_id = uuid4()
 send_blast(cms, blast_id)              [Stage 5]
    ├─ MockSender.send() per message
    ├─ INSERT blast_log (status=mocked/sent/failed)
-   └─ UPSERT customer_blast_status (last_sent_at, sent_promo_types)
+   └─ UPSERT customer (phone_number, last_sent_at, sent_promo_types)
    │
    ▼
 Response { blast_id, total, total_sent, total_failed, sender_mode }
@@ -281,7 +281,7 @@ Response { blast_id, total, total_sent, total_failed, sender_mode }
 
 **Implemented and verified:**
 - Stages 1–5 pipeline (data → analysis → promo → message → dispatch)
-- 2-table SQLite persistence (`blast_log`, `customer_blast_status`)
+- 2-table SQLite persistence (`blast_log`, `customer`)
 - 5 FastAPI endpoints across 3 route files
 - Cooldown filtering (7-day default)
 - Pre-flight validation with full-blast abort on failure
@@ -290,5 +290,5 @@ Response { blast_id, total, total_sent, total_failed, sender_mode }
 **Pending (pre-production):**
 - `MetaSender` real implementation (Meta Cloud API)
 - Stage 7 Streamlit dashboard (optional)
-- Consent / opt-out mechanism (legal requirement before real use)
+- Consent / opt-out mechanism — infrastructure + STOP-keyword detection in place (`webhook.py` flags `customer.is_unsubscribe = 1` for inbound `STOP`); cooldown filter still pending
 - API authentication (`API_KEY` middleware)

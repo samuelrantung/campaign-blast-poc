@@ -48,9 +48,11 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_blast_log_customer_id
                 ON blast_log (customer_id);
                            
-            CREATE TABLE IF NOT EXISTS customer_blast_status (
+            CREATE TABLE IF NOT EXISTS customer (
                 customer_id         TEXT PRIMARY KEY,
                 last_sent_at        TIMESTAMP NOT NULL,
-                sent_promo_types    TEXT NOT NULL DEFAULT '' -- comma-separated
+                sent_promo_types    TEXT NOT NULL DEFAULT '', -- comma-separated
+                phone_number        TEXT,
+                is_unsubscribe      INTEGER NOT NULL DEFAULT 0
             );
         """)

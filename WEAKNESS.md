@@ -172,7 +172,7 @@
 
 **3.4 — `is_sent` flag + customer blast status tracking:**
 
-- Maintain a `customer_blast_status.json` file keyed by `customer_id`:
+- Maintain a `customer` table (in `wa_blast.db`) keyed by `customer_id` — formerly a `customer_blast_status.json` file in the original proposal:
   ```json
   {
     "C001": {
@@ -227,22 +227,30 @@
 | --- | ------------------------------------------------------------------------------------------------ | ----------- | ----------- |
 | #   | Weakness                                                                                         | Level       | Status      |
 | --- | --------                                                                                         | -----       | ------      |
-| 5.1 | **No opt-out / unsubscribe mechanism.** Legal requirement in most jurisdictions and Meta policy. | 🔴 Critical | ⏸ Deferred  |
+| 5.1 | **Opt-out / unsubscribe mechanism** — infrastructure in place (webhook receiver + `customer.is_unsubscribe` column + `incoming_messages` table); STOP-keyword detection and cooldown filter still to be wired. | 🔴 Critical | 🟡 Partial |
 | 5.2 | **Blast log is append-only JSONL with no indexing.** No fast cooldown lookup.                    | 🟡 Medium   | ✅ Resolved |
 | 5.3 | **No distinction between API errors and business errors.**                                       | 🟡 Medium   | ✅ Resolved |
 
 ### Resolutions
 
-**5.1 — Deferred, open questions documented:**
+**5.1 — Partial: infrastructure landed, last-mile wiring pending:**
 
-- Skipped for POC — no consent or opt-out mechanism implemented
-- Must be resolved before any real customer data is used
-- **Open questions that need business decisions before implementing:**
-  - What counts as consent? Options: checkbox at registration, reply "YES" to an opt-in message, implicit (existing customer relationship)
-  - How does a customer opt out? Options: reply "STOP" to any blast (Meta actually recommends this), a link in the message, contact customer service
-  - Where is consent stored? Needs a `consent` boolean field in the customer schema, set by whatever registration/opt-in flow the business uses
-  - Who is responsible for maintaining the opt-out list? Our service or the upstream CRM?
-- Meta's own policy requires that customers can reply "STOP" to opt out — this ties into reply handling which is also out of scope
+The opt-out path follows Meta's recommended pattern (customer replies "STOP"). The infrastructure is implemented; the behavioral wiring is the remaining work.
+
+- **Done:**
+  - `webhook.py` — standalone Flask webhook receiver (deployed separately, e.g. Render) that handles Meta's verification handshake and inbound `messages` notifications
+  - `incoming_messages` table — every inbound message is persisted with `sender`, `content`, `received_at`
+  - `customer.is_unsubscribe` column added (`INTEGER NOT NULL DEFAULT 0`)
+  - `customer.phone_number` column populated on each blast — gives the opt-out lookup a key to match inbound messages against
+  - STOP-keyword detection in `webhook.py` — exact match against `STOP` (case-insensitive, whitespace-trimmed); fires `UPDATE customer SET is_unsubscribe = 1 WHERE REPLACE(phone_number, '+', '') = ?`
+
+- **Pending (last mile):**
+  - Exclusion in dispatch — extend `_apply_cooldown` in `Pipeline/api/routes/blast.py` to also drop customers with `is_unsubscribe = 1`
+
+- **Open business decisions (not blockers):**
+  - What counts as initial consent (registration checkbox, implicit relationship)
+  - Whether to recognize additional opt-out keywords beyond `STOP` (e.g. "UNSUBSCRIBE", "BERHENTI")
+  - Whether unsubscribes should propagate to the upstream CRM
 
 **5.2 — Blast log moved to SQLite:**
 

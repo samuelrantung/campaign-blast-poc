@@ -54,7 +54,7 @@ These decisions are final and should not be re-proposed unless explicitly revisi
 - Handling customer replies or inbound messages
 - Meta template submission and approval workflow
 - Real-time delivery status webhooks from Meta
-- Customer opt-out / unsubscribe management *(known legal gap — must be addressed before production)*
+- ~~Customer opt-out / unsubscribe management~~ *(infrastructure in place via `customer.is_unsubscribe` + webhook receiver — STOP-keyword wiring still pending)*
 - Multi-language message support
 - A/B testing of promo types
 - Automated scheduling / cron-based blast triggers *(manual trigger via `POST /blast/send` for POC)*
@@ -118,7 +118,7 @@ wa-blast/
 │   └── app.py                 # Streamlit UI (optional)
 │
 ├── database/
-│   └── wa_blast.db            # SQLite database — tables: promo_codes, blast_log, customer_blast_status
+│   └── wa_blast.db            # SQLite database — tables: promo_codes, blast_log, customer, incoming_messages
 │
 ├── logs/
 │   ├── failed_messages.jsonl  # Messages that failed pre-flight validation (missing slots, over limit)
@@ -430,19 +430,21 @@ Simple mapping function — no database, no lifecycle, no cooldown. Input is `At
 
 **Budget cap:** After any strategy (rule-based or AI) produces a `PromoOffer`, a validation step checks the discount value against `MAX_DISCOUNT_PERCENT` (default: `30`). If exceeded, the value is clamped to the cap. This is enforced once at the output boundary regardless of which strategy ran.
 
-**Cooldown and deduplication guard:** Before assigning a promo, query the `customer_blast_status` table in `wa_blast.db` against two rules:
+**Cooldown and deduplication guard:** Before assigning a promo, query the `customer` table in `wa_blast.db` against two rules:
 1. **Time cooldown** — skip if `last_sent_at` exists and is within `BLAST_COOLDOWN_DAYS` (default: 7 days)
 2. **Promo deduplication** — exclude any promo types already recorded in `sent_promo_types` for this customer, ensuring each customer receives a different offer on every re-engagement attempt
 
-**`customer_blast_status` table (SQLite, in `wa_blast.db`):**
+**`customer` table (SQLite, in `wa_blast.db`):**
 
 | Column | Type | Description |
 |---|---|---|
 | `customer_id` | string (PK) | Customer identifier |
+| `phone_number` | string | Most recent phone number sent to (nullable) |
 | `last_sent_at` | datetime | Timestamp of most recent successful dispatch to this customer |
 | `sent_promo_types` | string | Comma-separated list of promo types already sent (e.g. `discount_30,bogo`) |
+| `is_unsubscribe` | integer | `1` if customer has opted out, `0` otherwise (default `0`) |
 
-After successful dispatch, `last_sent_at` is updated and the new promo type is appended to `sent_promo_types`. Indexed on `customer_id` for O(1) lookup. All blast state now lives in a single `wa_blast.db` — no separate JSON file.
+After successful dispatch, `phone_number` and `last_sent_at` are updated and the new promo type is appended to `sent_promo_types`. Indexed on `customer_id` for O(1) lookup. All per-customer state now lives in a single `wa_blast.db` — no separate JSON file.
 
 **Output:**
 - `PromoOffer` object per customer:
@@ -576,15 +578,21 @@ Content-Type: application/json
 | `error_reason` | string | Human-readable failure reason |
 | `sent_at` | datetime | Dispatch timestamp |
 
-**Opt-out / consent — deferred, open questions:**
-- Not implemented for POC
-- Must be resolved before any real customer data is used
-- Open questions pending business decisions: what constitutes consent (registration checkbox, opt-in reply, implicit relationship), how customers opt out (reply "STOP", message link, customer service), where consent is stored and who maintains the opt-out list
-- Meta recommends customers can reply "STOP" to any blast — this ties into reply handling which is also out of scope for POC
+**Opt-out / consent — infrastructure in place, behavioral wiring pending:**
+
+The opt-out path is implemented as a Meta webhook + DB-backed flag, following Meta's own recommendation that customers can reply "STOP" to any blast:
+
+1. **Inbound webhook** (`webhook.py`, Flask app deployed separately) receives all inbound WhatsApp messages and writes each to the `incoming_messages` table (`sender`, `content`, `received_at`)
+2. **STOP detection** — when an inbound text message exactly matches `STOP` (case-insensitive, whitespace-trimmed), the webhook sets `customer.is_unsubscribe = 1` for the matching `phone_number`
+3. **Dispatch filter** (pending) — `_apply_cooldown` (or a new `_apply_unsubscribe` step) excludes any customer with `is_unsubscribe = 1` before the blast goes out
+
+Schema additions already in place: `customer.is_unsubscribe INTEGER NOT NULL DEFAULT 0` and the `incoming_messages` table. See the Database Layer section above.
+
+Remaining open questions (business decisions, not blockers): what constitutes initial consent (registration checkbox vs. implicit existing-customer relationship), whether additional opt-out keywords should be recognized (currently only `STOP`), and whether unsubscribes propagate back to the upstream CRM.
 
 **Known gaps / extension points:**
-- Consent and opt-out mechanism — required before production
-- Future: webhook listener to receive Meta delivery receipts (delivered, read, failed)
+- Exclusion of `is_unsubscribe = 1` customers in `_apply_cooldown` (last mile of opt-out — STOP detection in `webhook.py` already wired)
+- Future: handle Meta delivery receipts (`delivered`, `read`, `failed`) — webhook already receives them via `value.statuses`
 - Future: send scheduling per customer timezone
 
 ---
@@ -694,7 +702,7 @@ All configuration lives in `.env` (secrets) and `config.py` (defaults with env o
 ┌──────────────────────────────────────────┐
 │  Rule-Based Promo Mapping Table          │
 │  (+ cooldown check vs.                   │
-│     customer_blast_status SQLite table)  │
+│     customer SQLite table)               │
 │  → PromoOffer per customer               │
 │  → promo_codes written as pending        │
 └────────┬─────────────────────────────────┘
@@ -717,7 +725,8 @@ All configuration lives in `.env` (secrets) and `config.py` (defaults with env o
 │  wa_blast.db (SQLite)          │
 │  tables: blast_log,            │
 │          promo_codes,          │
-│          customer_blast_status │
+│          customer,             │
+│          incoming_messages     │
 └────────────────────────────────┘
 ```
 
@@ -732,7 +741,7 @@ These are planned features with defined integration points. Do not implement unt
 | AI Promo Generator (Claude API) | Replaces or augments `promo/mapping.py` in Stage 3 |
 | ML retraining pipeline | Automate periodic retraining of `churn_rf.pkl` as new blast outcome data accumulates |
 | Delivery receipt webhooks | New FastAPI route consuming Meta webhook callbacks |
-| Customer opt-out management | New `consent` field in `data/schema.py`, checked in Stage 5 |
+| Customer opt-out management | Infrastructure + STOP detection done (`customer.is_unsubscribe`, `incoming_messages`, webhook flags opt-outs); last mile is the exclusion filter in `_apply_cooldown` |
 | Feedback loop automation | Feed redemption rates from `GET /analytics/blast/{id}` back into Stage 3 promo mapping automatically |
 | Automated scheduling | Cron or APScheduler wrapper around `POST /blast/send` — manual trigger is used for POC |
 | A/B testing | Split at-risk list in Stage 3, assign different promo rules per group |
@@ -746,7 +755,7 @@ These are documented weaknesses that must be resolved before production. See `WE
 
 | ID | Gap | Severity | Stage |
 |---|---|---|---|
-| 5.1 | No opt-out / consent mechanism — legal requirement | 🔴 Critical | Stage 5 |
+| 5.1 | Opt-out via webhook + `customer.is_unsubscribe` — infrastructure and STOP-keyword detection landed, cooldown exclusion filter still pending | 🟡 Partial | Stage 5 |
 | 2.1 | Versioned `ScoringStrategy` interface — v1.0 uses percentile quintiles, future versions are drop-in | ✅ Resolved | Stage 2 |
 | 2.2 | Combined score = R+F+M sum for v1.0; formula is part of the versioned strategy | ✅ Resolved | Stage 2 |
 | 3.1 | AI decoupled from core — Stage 3 is now rule-based promo assignment | ✅ Resolved | Stage 3 |
@@ -754,7 +763,7 @@ These are documented weaknesses that must be resolved before production. See `WE
 | 2.4 | `MAX_BLAST_SIZE` cap with top-N priority sort by `combined_score` | ✅ Resolved | Stage 2 |
 | 2.5 | New customer exclusion via `created_at` + `MIN_CUSTOMER_AGE_DAYS` | ✅ Resolved | Stage 2 |
 | 2.6 | Seasonality reframed as opportunity — seasonal customers stay in pool intentionally | ✅ Resolved | Stage 2 |
-| 3.4 | `is_sent` via `customer_blast_status.json` — O(1) cooldown + promo deduplication | ✅ Resolved | Stage 3 |
+| 3.4 | `is_sent` via `customer` table — O(1) cooldown + promo deduplication | ✅ Resolved | Stage 3 |
 | 3.3 | Per-customer unique codes in SQLite `promo_codes` table — validate/redeem via API | ✅ Resolved | Stage 3 |
 | 3.2 | `MAX_DISCOUNT_PERCENT` cap enforced at `PromoOffer` validation — all strategies clamped | ✅ Resolved | Stage 3 |
 | 1.1 | Transaction deduplication + blast cooldown + promo deduplication — all defined | ✅ Resolved | Stage 1 + 3 |
@@ -772,8 +781,8 @@ These are documented weaknesses that must be resolved before production. See `WE
 | G.2 | Flow diagram updated — AI removed, Promo Assignment shown | ✅ Resolved | Diagram |
 | G.3 | Manual trigger via `POST /blast/send` for POC | ✅ Resolved | Stage 6 |
 | 6.1 | No API authentication — add one middleware + `API_KEY` config when ready | ⏸ Noted | Stage 6 |
-| 5.1 | No opt-out / consent mechanism — legal requirement before production | 🔴 Deferred | Stage 5 |
-| C2 | `customer_blast_status` moved from JSON file to SQLite `wa_blast.db` — single source of truth | ✅ Resolved | Stage 3 |
+| 5.1 | Opt-out infrastructure (webhook + `customer.is_unsubscribe` + `incoming_messages`) and STOP-keyword detection landed; cooldown exclusion filter still to be wired | 🟡 Partial | Stage 5 |
+| C2 | `customer` table (formerly `customer_blast_status`) moved from JSON file to SQLite `wa_blast.db` — single source of truth, also tracks `phone_number` and `is_unsubscribe` | ✅ Resolved | Stage 3 |
 | C3 | `blast_id` UUID column added to `blast_log` — enables `GET /analytics/blast/{id}` grouping | ✅ Resolved | Stage 5 |
 | C4 | Promo code lifecycle: `pending → active → redeemed/cancelled` — orphaned codes from aborted blasts are never redeemable | ✅ Resolved | Stage 3/4/5 |
 | C5 | SQL filter injection guard specified: `sqlparse` AST walk, token allowlist/blocklist, parameterized execution | ✅ Resolved | Stage 2 |
