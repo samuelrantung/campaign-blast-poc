@@ -54,7 +54,7 @@ These decisions are final and should not be re-proposed unless explicitly revisi
 - Handling customer replies or inbound messages
 - Meta template submission and approval workflow
 - Real-time delivery status webhooks from Meta
-- ~~Customer opt-out / unsubscribe management~~ *(infrastructure in place via `customer.is_unsubscribe` + webhook receiver — STOP-keyword wiring still pending)*
+- ~~Customer opt-out / unsubscribe management~~ *(implemented: webhook + STOP detection + `customer.is_unsubscribe` flag + dispatch-time exclusion in `_filter_unsubscribed`)*
 - Multi-language message support
 - A/B testing of promo types
 - Automated scheduling / cron-based blast triggers *(manual trigger via `POST /blast/send` for POC)*
@@ -578,20 +578,19 @@ Content-Type: application/json
 | `error_reason` | string | Human-readable failure reason |
 | `sent_at` | datetime | Dispatch timestamp |
 
-**Opt-out / consent — infrastructure in place, behavioral wiring pending:**
+**Opt-out / consent — implemented end-to-end:**
 
-The opt-out path is implemented as a Meta webhook + DB-backed flag, following Meta's own recommendation that customers can reply "STOP" to any blast:
+The opt-out path is implemented as a Meta webhook + DB-backed flag + dispatch-time filter, following Meta's own recommendation that customers can reply "STOP" to any blast:
 
 1. **Inbound webhook** (`webhook.py`, Flask app deployed separately) receives all inbound WhatsApp messages and writes each to the `incoming_messages` table (`sender`, `content`, `received_at`)
 2. **STOP detection** — when an inbound text message exactly matches `STOP` (case-insensitive, whitespace-trimmed), the webhook sets `customer.is_unsubscribe = 1` for the matching `phone_number`
-3. **Dispatch filter** (pending) — `_apply_cooldown` (or a new `_apply_unsubscribe` step) excludes any customer with `is_unsubscribe = 1` before the blast goes out
+3. **Dispatch filter** — `_filter_unsubscribed()` in `Pipeline/api/routes/blast.py` drops any customer with `is_unsubscribe = 1` from the at-risk list, applied in both `POST /blast/preview` and `POST /blast/send` after the cooldown filter
 
-Schema additions already in place: `customer.is_unsubscribe INTEGER NOT NULL DEFAULT 0` and the `incoming_messages` table. See the Database Layer section above.
+Schema additions: `customer.is_unsubscribe INTEGER NOT NULL DEFAULT 0` and the `incoming_messages` table. See the Database Layer section above.
 
 Remaining open questions (business decisions, not blockers): what constitutes initial consent (registration checkbox vs. implicit existing-customer relationship), whether additional opt-out keywords should be recognized (currently only `STOP`), and whether unsubscribes propagate back to the upstream CRM.
 
 **Known gaps / extension points:**
-- Exclusion of `is_unsubscribe = 1` customers in `_apply_cooldown` (last mile of opt-out — STOP detection in `webhook.py` already wired)
 - Future: handle Meta delivery receipts (`delivered`, `read`, `failed`) — webhook already receives them via `value.statuses`
 - Future: send scheduling per customer timezone
 
@@ -741,7 +740,7 @@ These are planned features with defined integration points. Do not implement unt
 | AI Promo Generator (Claude API) | Replaces or augments `promo/mapping.py` in Stage 3 |
 | ML retraining pipeline | Automate periodic retraining of `churn_rf.pkl` as new blast outcome data accumulates |
 | Delivery receipt webhooks | New FastAPI route consuming Meta webhook callbacks |
-| Customer opt-out management | Infrastructure + STOP detection done (`customer.is_unsubscribe`, `incoming_messages`, webhook flags opt-outs); last mile is the exclusion filter in `_apply_cooldown` |
+| Customer opt-out management | Fully implemented — webhook + STOP detection + `customer.is_unsubscribe` flag + dispatch exclusion via `_filter_unsubscribed` in `Pipeline/api/routes/blast.py` |
 | Feedback loop automation | Feed redemption rates from `GET /analytics/blast/{id}` back into Stage 3 promo mapping automatically |
 | Automated scheduling | Cron or APScheduler wrapper around `POST /blast/send` — manual trigger is used for POC |
 | A/B testing | Split at-risk list in Stage 3, assign different promo rules per group |
@@ -755,7 +754,7 @@ These are documented weaknesses that must be resolved before production. See `WE
 
 | ID | Gap | Severity | Stage |
 |---|---|---|---|
-| 5.1 | Opt-out via webhook + `customer.is_unsubscribe` — infrastructure and STOP-keyword detection landed, cooldown exclusion filter still pending | 🟡 Partial | Stage 5 |
+| 5.1 | Opt-out flow end-to-end: webhook receives inbound messages, STOP detection flips `customer.is_unsubscribe = 1`, `_filter_unsubscribed` drops opted-out customers before dispatch | ✅ Resolved | Stage 5 |
 | 2.1 | Versioned `ScoringStrategy` interface — v1.0 uses percentile quintiles, future versions are drop-in | ✅ Resolved | Stage 2 |
 | 2.2 | Combined score = R+F+M sum for v1.0; formula is part of the versioned strategy | ✅ Resolved | Stage 2 |
 | 3.1 | AI decoupled from core — Stage 3 is now rule-based promo assignment | ✅ Resolved | Stage 3 |
@@ -781,7 +780,7 @@ These are documented weaknesses that must be resolved before production. See `WE
 | G.2 | Flow diagram updated — AI removed, Promo Assignment shown | ✅ Resolved | Diagram |
 | G.3 | Manual trigger via `POST /blast/send` for POC | ✅ Resolved | Stage 6 |
 | 6.1 | No API authentication — add one middleware + `API_KEY` config when ready | ⏸ Noted | Stage 6 |
-| 5.1 | Opt-out infrastructure (webhook + `customer.is_unsubscribe` + `incoming_messages`) and STOP-keyword detection landed; cooldown exclusion filter still to be wired | 🟡 Partial | Stage 5 |
+| 5.1 | Opt-out flow end-to-end: webhook + STOP detection + `customer.is_unsubscribe` + `_filter_unsubscribed` dispatch filter | ✅ Resolved | Stage 5 |
 | C2 | `customer` table (formerly `customer_blast_status`) moved from JSON file to SQLite `wa_blast.db` — single source of truth, also tracks `phone_number` and `is_unsubscribe` | ✅ Resolved | Stage 3 |
 | C3 | `blast_id` UUID column added to `blast_log` — enables `GET /analytics/blast/{id}` grouping | ✅ Resolved | Stage 5 |
 | C4 | Promo code lifecycle: `pending → active → redeemed/cancelled` — orphaned codes from aborted blasts are never redeemable | ✅ Resolved | Stage 3/4/5 |

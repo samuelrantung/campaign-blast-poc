@@ -227,25 +227,22 @@
 | --- | ------------------------------------------------------------------------------------------------ | ----------- | ----------- |
 | #   | Weakness                                                                                         | Level       | Status      |
 | --- | --------                                                                                         | -----       | ------      |
-| 5.1 | **Opt-out / unsubscribe mechanism** — infrastructure in place (webhook receiver + `customer.is_unsubscribe` column + `incoming_messages` table); STOP-keyword detection and cooldown filter still to be wired. | 🔴 Critical | 🟡 Partial |
+| 5.1 | **Opt-out / unsubscribe mechanism** — webhook receiver + `customer.is_unsubscribe` flag + STOP-keyword detection + dispatch-time exclusion. | 🔴 Critical | ✅ Resolved |
 | 5.2 | **Blast log is append-only JSONL with no indexing.** No fast cooldown lookup.                    | 🟡 Medium   | ✅ Resolved |
 | 5.3 | **No distinction between API errors and business errors.**                                       | 🟡 Medium   | ✅ Resolved |
 
 ### Resolutions
 
-**5.1 — Partial: infrastructure landed, last-mile wiring pending:**
+**5.1 — Resolved end-to-end:**
 
-The opt-out path follows Meta's recommended pattern (customer replies "STOP"). The infrastructure is implemented; the behavioral wiring is the remaining work.
+The opt-out path follows Meta's recommended pattern (customer replies "STOP"). Implementation:
 
-- **Done:**
-  - `webhook.py` — standalone Flask webhook receiver (deployed separately, e.g. Render) that handles Meta's verification handshake and inbound `messages` notifications
-  - `incoming_messages` table — every inbound message is persisted with `sender`, `content`, `received_at`
-  - `customer.is_unsubscribe` column added (`INTEGER NOT NULL DEFAULT 0`)
-  - `customer.phone_number` column populated on each blast — gives the opt-out lookup a key to match inbound messages against
-  - STOP-keyword detection in `webhook.py` — exact match against `STOP` (case-insensitive, whitespace-trimmed); fires `UPDATE customer SET is_unsubscribe = 1 WHERE REPLACE(phone_number, '+', '') = ?`
-
-- **Pending (last mile):**
-  - Exclusion in dispatch — extend `_apply_cooldown` in `Pipeline/api/routes/blast.py` to also drop customers with `is_unsubscribe = 1`
+- `webhook.py` — standalone Flask webhook receiver (deployed separately, e.g. Render) that handles Meta's verification handshake and inbound `messages` notifications
+- `incoming_messages` table — every inbound message is persisted with `sender`, `content`, `received_at`
+- `customer.is_unsubscribe` column (`INTEGER NOT NULL DEFAULT 0`)
+- `customer.phone_number` column populated on each blast — provides the lookup key to match inbound messages against
+- STOP-keyword detection in `webhook.py` — exact match against `STOP` (case-insensitive, whitespace-trimmed); fires `UPDATE customer SET is_unsubscribe = 1 WHERE REPLACE(phone_number, '+', '') = ?`
+- `_filter_unsubscribed()` in `Pipeline/api/routes/blast.py` — drops opted-out customers before promo assignment, applied in both `POST /blast/preview` and `POST /blast/send`
 
 - **Open business decisions (not blockers):**
   - What counts as initial consent (registration checkbox, implicit relationship)

@@ -290,5 +290,5 @@ Response { blast_id, total, total_sent, total_failed, sender_mode }
 **Pending (pre-production):**
 - `MetaSender` real implementation (Meta Cloud API)
 - Stage 7 Streamlit dashboard (optional)
-- Consent / opt-out mechanism — infrastructure + STOP-keyword detection in place (`webhook.py` flags `customer.is_unsubscribe = 1` for inbound `STOP`); cooldown filter still pending
+- ~~Consent / opt-out mechanism~~ — fully implemented (`webhook.py` flags `customer.is_unsubscribe = 1` for inbound `STOP`; `_filter_unsubscribed` in `blast.py` drops opted-out customers before dispatch)
 - API authentication (`API_KEY` middleware)

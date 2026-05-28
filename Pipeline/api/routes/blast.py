@@ -35,6 +35,15 @@ def _apply_cooldown(at_risk):
     return [c for c in at_risk if c.customer_id not in on_cooldown]
 
 
+def _filter_unsubscribed(at_risk):
+    with transaction() as conn:
+        rows = conn.execute(
+            "SELECT customer_id FROM customer WHERE is_unsubscribe = 1"
+        ).fetchall()
+    unsubscribed = {r["customer_id"] for r in rows}
+    return [c for c in at_risk if c.customer_id not in unsubscribed]
+
+
 def assign_promos(at_risk):
     return [CustomerMessage(customer=c, promo=assign_promo(c)) for c in at_risk]
 
@@ -113,6 +122,7 @@ class BlastRequest(BaseModel):
 def blast_send(body: BlastRequest):
     at_risk = _run_engine(body.ml_enabled)
     at_risk = _apply_cooldown(at_risk)
+    at_risk = _filter_unsubscribed(at_risk)
     customer_messages = assign_promos(at_risk)
     customer_messages = construct_messages(customer_messages)
 
@@ -142,6 +152,7 @@ def blast_send(body: BlastRequest):
 def blast_preview(body: BlastRequest):
     at_risk = _run_engine(body.ml_enabled)
     at_risk = _apply_cooldown(at_risk)
+    at_risk = _filter_unsubscribed(at_risk)
     customer_messages = assign_promos(at_risk)
     customer_messages = construct_messages(customer_messages)
     errors = validate_messages(customer_messages)
