@@ -28,11 +28,20 @@ def _apply_cooldown(at_risk):
     cutoff = (datetime.now() - timedelta(days=BLAST_COOLDOWN_DAYS)).isoformat()
     with transaction() as conn:
         rows = conn.execute(
-            "SELECT customer_id FROM customer_blast_status WHERE last_sent_at >= ?",
+            "SELECT customer_id FROM customer WHERE last_sent_at >= ?",
             (cutoff,),
         ).fetchall()
     on_cooldown = {r["customer_id"] for r in rows}
     return [c for c in at_risk if c.customer_id not in on_cooldown]
+
+
+def _filter_unsubscribed(at_risk):
+    with transaction() as conn:
+        rows = conn.execute(
+            "SELECT customer_id FROM customer WHERE is_unsubscribe = 1"
+        ).fetchall()
+    unsubscribed = {r["customer_id"] for r in rows}
+    return [c for c in at_risk if c.customer_id not in unsubscribed]
 
 
 def assign_promos(at_risk):
@@ -80,9 +89,10 @@ def send_blast(customer_messages, blast_id):
             )
             conn.execute(
                 """
-                INSERT INTO customer_blast_status (customer_id, last_sent_at, sent_promo_types)
-                VALUES (?, ?, ?)
+                INSERT INTO customer (customer_id, phone_number, last_sent_at, sent_promo_types)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(customer_id) DO UPDATE SET
+                    phone_number = excluded.phone_number,
                     last_sent_at = excluded.last_sent_at,
                     sent_promo_types = CASE
                         WHEN sent_promo_types = '' THEN excluded.sent_promo_types
@@ -91,6 +101,7 @@ def send_blast(customer_messages, blast_id):
                 """,
                 (
                     cm.customer.customer_id,
+                    cm.message.to,
                     datetime.now().isoformat(),
                     cm.promo.promo_type,
                 ),
@@ -111,6 +122,7 @@ class BlastRequest(BaseModel):
 def blast_send(body: BlastRequest):
     at_risk = _run_engine(body.ml_enabled)
     at_risk = _apply_cooldown(at_risk)
+    at_risk = _filter_unsubscribed(at_risk)
     customer_messages = assign_promos(at_risk)
     customer_messages = construct_messages(customer_messages)
 
@@ -140,6 +152,7 @@ def blast_send(body: BlastRequest):
 def blast_preview(body: BlastRequest):
     at_risk = _run_engine(body.ml_enabled)
     at_risk = _apply_cooldown(at_risk)
+    at_risk = _filter_unsubscribed(at_risk)
     customer_messages = assign_promos(at_risk)
     customer_messages = construct_messages(customer_messages)
     errors = validate_messages(customer_messages)
